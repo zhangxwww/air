@@ -1,0 +1,12 @@
+*.pth
+*.xlsx
+*.npy
+*.tar.gz
+
+.idea/
+.ipynb_checkpoints/
+*.ipynb
+
+__pycache__/
+runs/
+dataset/
