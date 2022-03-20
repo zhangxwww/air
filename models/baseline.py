@@ -1,12 +1,10 @@
-import enum
-from numpy.lib.function_base import select
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from .moco import ModelMoCo
 from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
-from torch.utils.data import DataLoader, dataloader
+from torch.utils.data import DataLoader
 import copy
 import numpy as np
 
@@ -576,7 +574,7 @@ class Baseline_v4(nn.Module):
         super(Baseline_v4, self).__init__()
 
         self.args = args
-        self.moco = ModelMoCo(dim=args.moco_dim, K=args.moco_k, m=args.moco_m, T=args.moco_t, bn_splits=args.bn_splits, multi_branch=True)
+        self.moco = ModelMoCo(dim=args.moco_dim, K=args.moco_k, m=args.moco_m, T=args.moco_t, bn_splits=args.bn_splits, multi_branch=True, branch_depth=args.branch_depth, all_branch=args.all_branch, same_branch=args.same_branch)
         self.feature_dim = args.moco_dim
 
         self.cluster_head = nn.ModuleList([nn.Linear(self.feature_dim, args.num_unlabeled_classes_per_stage, bias=False)\
@@ -590,8 +588,10 @@ class Baseline_v4(nn.Module):
 
         self.compute_means = True
         self.exemplar_means = []
+        self.means_labels = []
 
         self.n_classes = args.num_labeled_classes
+        self.already_calc_means_for_stage = [False, False, False, False]
 
     def forward(self, x, stage):
         x = self.moco.encoder_q(x, stage)
@@ -622,6 +622,10 @@ class Baseline_v4(nn.Module):
         self.fc = nn.Linear(in_features, out_features+n, bias=False).to(device)
         self.fc.weight.data[:out_features] = weight
         self.n_classes += n
+
+        if self.args.same_branch:
+            for b in range(4):
+                self.cluster_head[b] = nn.Linear(self.feature_dim, self.args.num_unlabeled_classes_per_stage, bias=False).to(device)
 
     def reduce_exemplar_sets(self, m):
         for y, P_y in enumerate(self.exemplar_sets):
@@ -794,7 +798,7 @@ class Baseline_v4(nn.Module):
             self.exemplar_sets.append(data_in_t[:m].cpu().numpy())
             self.exemplar_sets_aug.append(data_aug_in_t[:m].cpu().numpy())
 
-
+    '''
     def pseudo_labeling_and_combine_with_exemplars(self, dataset, target_list, stage):
         mode = self.training
         self.eval()
@@ -837,63 +841,127 @@ class Baseline_v4(nn.Module):
         self.train(mode=mode)
 
         return torch.utils.data.TensorDataset(data, data_aug, pseudo)
-
+    '''
 
     @torch.no_grad()
     def calculate_exemplar_means(self, device, stage):
         #if self.compute_means:
         exemplar_means = []
-        for l, P_y in enumerate(self.exemplar_sets):
-            if l < len(self.exemplar_means):
-                continue
-            exemplars = []
-            for ex in P_y:
-                exemplars.append(torch.from_numpy(ex))
-            if len(exemplars) == 0:
-                continue
-            exemplars = torch.stack(exemplars).to(device)
-            with torch.no_grad():
-                features = self.moco.encoder_q(exemplars, stage)
-            features = F.normalize(features, dim=1, p=2)
-            mu_y = features.mean(0, keepdim=True)
-            mu_y = F.normalize(mu_y, dim=1, p=2)
-            exemplar_means.append(mu_y.squeeze())
+        means_labels = []
 
-        self.exemplar_means += exemplar_means
-            #self.compute_means = False
+        if self.args.no_cache_means:
+            for l, P_y in enumerate(self.exemplar_sets):
+                exemplars = []
+                for ex in P_y:
+                    exemplars.append(torch.from_numpy(ex))
+                if len(exemplars) == 0:
+                    continue
+                exemplars = torch.stack(exemplars).to(device)
+                with torch.no_grad():
+                    branch = 0 if l < 70 else ((l - 70) // 10 + 1)
+                    features = self.moco.encoder_q(exemplars, branch)
+                features = F.normalize(features, dim=1, p=2)
+                mu_y = features.mean(0, keepdim=True)
+                mu_y = F.normalize(mu_y, dim=1, p=2)
+                exemplar_means.append(mu_y.squeeze())
+                means_labels.append(l)
+
+            self.exemplar_means = exemplar_means
+            self.means_labels = means_labels
+
+        elif not self.already_calc_means_for_stage[stage]:
+            self.already_calc_means_for_stage[stage] = True
+            for l, P_y in enumerate(self.exemplar_sets):
+                exemplars = []
+                for ex in P_y:
+                    exemplars.append(torch.from_numpy(ex))
+                if len(exemplars) == 0:
+                    continue
+                exemplars = torch.stack(exemplars).to(device)
+                with torch.no_grad():
+                    features = self.moco.encoder_q(exemplars, stage)
+                features = F.normalize(features, dim=1, p=2)
+                mu_y = features.mean(0, keepdim=True)
+                mu_y = F.normalize(mu_y, dim=1, p=2)
+                exemplar_means.append(mu_y.squeeze())
+                means_labels.append(l)
+
+            self.exemplar_means += exemplar_means
+            self.means_labels += means_labels
 
         return self.exemplar_means
 
 
+    @torch.no_grad()
     def classify(self, x, stage):
         mode = self.training
         self.eval()
 
-        with torch.no_grad():
-            self.calculate_exemplar_means(x.device, stage)
-
-        exemplar_means = self.exemplar_means
-        means = torch.stack(exemplar_means)        # (n_classes, feature_dim)
-
-        with torch.no_grad():
-            feature = self.moco.encoder_q(x, 0)
-            if self.args.norm_before_add:
-                feature = F.normalize(feature, dim=1, p=2) # (batch_size, feature_dim)
-            for s in range(1, stage):
-                branch_feature = self.moco.encoder_q(x, s)
-                if self.args.norm_before_add:
-                    branch_feature = F.normalize(branch_feature, dim=1, p=2)
-                feature = feature * self.args.ema_beta + branch_feature * (1 - self.args.ema_beta)
-            feature = F.normalize(feature, dim=1, p=2) # (batch_size, feature_dim)
+        self.calculate_exemplar_means(x.device, stage)
 
         if self.args.dist == 'euclidean':
             dist_func = euclidean_distances
         elif self.args.dist == 'cosine':
             dist_func = cosine_distances
 
-        dists = dist_func(feature.cpu().numpy(), means.cpu().numpy())   # (batch_size, n_classes)
-        dists = torch.from_numpy(dists).to(x.device)
+        exemplar_means = self.exemplar_means
+        means = torch.stack(exemplar_means)        # (n_classes, feature_dim)
+
+        if self.args.branch_feat in ['ema', 'conf']:
+            if self.args.branch_feat == 'ema':
+                feature = self.moco.encoder_q(x, 0)
+                if self.args.norm_before_add:
+                    feature = F.normalize(feature, dim=1, p=2) # (batch_size, feature_dim)
+                for s in range(1, stage + 1):
+                    branch_feature = self.moco.encoder_q(x, s)
+                    if self.args.norm_before_add:
+                        branch_feature = F.normalize(branch_feature, dim=1, p=2)
+                    feature = feature * self.args.ema_beta + branch_feature * (1 - self.args.ema_beta)
+                feature = F.normalize(feature, dim=1, p=2) # (batch_size, feature_dim)
+            elif self.args.branch_feat == 'conf':
+                cluster = []
+                branch_feature = []
+                for b in range(stage + 1):
+                    _, c, b = self.ce_stage(x, b)
+                    cluster.append(c)
+                    branch_feature.append(b)
+                cluster = torch.stack(cluster, dim=0).softmax(dim=2)  # b, n, c
+                branch_feature = torch.stack(branch_feature, dim=0)   # b, n, d
+                conf_of_each_branch, _ = cluster.max(dim=2)           # b, n
+                _, max_conf_branch_index = conf_of_each_branch.max(dim=0)  # n
+                feature = branch_feature[max_conf_branch_index, torch.arange(x.shape[0]), :]
+                feature = F.normalize(feature, dim=1, p=2) # (batch_size, feature_dim)
+            elif self.args.branch_feat == 'closest':
+                with torch.no_grad():
+                    pass
+
+            dists = dist_func(feature.cpu().numpy(), means.cpu().numpy())   # (batch_size, n_classes)
+            dists = torch.from_numpy(dists).to(x.device)
+
+        elif self.args.branch_feat == 'closest':
+            branch_dists = []
+            for b in range(4):
+                feature = self.moco.encoder_q(x, b)
+                feature = F.normalize(feature, dim=1, p=2)
+                dist = dist_func(feature.cpu().numpy(), means.cpu().numpy())
+                dist = torch.from_numpy(dist).to(x.device)
+                branch_dists.append(dist)
+            branch_dists = torch.stack(branch_dists, dim=0)
+            values, _ = branch_dists.min(dim=2)
+            _, values_indices = values.min(dim=0)
+            dists = branch_dists[values_indices, torch.arange(x.shape[0]), :]
+
+        elif self.args.branch_feat == 'new':
+            feature = self.moco.encoder_q(x, 1)
+            feature = F.normalize(feature, dim=1, p=2)
+            dists = dist_func(feature.cpu().numpy(), means.cpu().numpy())
+            dists = torch.from_numpy(dists).to(x.device)
+
+
+        mean_labels = torch.tensor(self.means_labels).long().to(x.device)
         value, preds = dists.min(1)
+        # TODO check ?
+        preds = mean_labels[preds]
 
         n_proto = means.shape[0]
         proto_dist = dist_func(means.cpu().numpy(), means.cpu().numpy())
@@ -904,29 +972,228 @@ class Baseline_v4(nn.Module):
         refuse_index = value >= thres2
 
         preds_with_refuse = None
-        if stage > 0:
+        if stage > 0 and (~refuse_index).sum() > 0:
             preds_with_refuse = dists[~refuse_index].argmin(1)
+            preds_with_refuse = mean_labels[preds_with_refuse]
 
         self.train(mode=mode)
 
         return preds, preds_with_refuse, refuse_index
 
+
+    @torch.no_grad()
+    def pseudo_labeling_and_combine_with_exemplars(self, dataset, target_list, branch, device, args):
+
+        n_classes = target_list[-1] + 1
+        if dataset is not None:
+            loader = DataLoader(dataset, batch_size=128, shuffle=True, pin_memory=True)
+            data = []
+            data_aug = []
+            pseudo = []
+
+            prototypes = self.calculate_exemplar_means(device, branch)
+            prototypes = torch.stack(prototypes, dim=0)
+
+            if self.args.dist == 'euclidean':
+                dist_func = euclidean_distances
+            elif self.args.dist == 'cosine':
+                dist_func = cosine_distances
+
+            proto_dist = dist_func(prototypes.cpu().numpy(), prototypes.cpu().numpy())
+            proto_dist = torch.from_numpy(proto_dist).to(device)
+            n_proto = prototypes.shape[0]
+            avg_proto_dist = proto_dist.sum() / (n_proto * (n_proto - 1))
+
+            thres1 = avg_proto_dist * self.args.thres1_ratio
+            thres2 = avg_proto_dist * self.args.thres2_ratio
+
+            label_2_proto = [0] * n_classes
+            for p, l in enumerate(self.means_labels):
+                label_2_proto[l] = p
+            label_2_proto = torch.tensor(label_2_proto).long().to(device)
+
+            for (x, aug), _, _ in loader:
+                x, aug = x.cuda(), aug.cuda()
+                _, cluster, feature = self.ce_stage(x, branch)
+                out = cluster.argmax(dim=1) + target_list[0]
+
+                feature_to_proto = dist_func(feature.cpu().detach().numpy(), prototypes.cpu().detach().numpy())
+                feature_to_proto = torch.from_numpy(feature_to_proto).to(device)
+
+                min_f_2_p, min_indices = feature_to_proto.min(dim=1)
+
+                refuse_indices = min_f_2_p >= thres2
+
+                feature = feature[~refuse_indices]
+                cluster_accept = cluster[~refuse_indices]
+                min_f_2_p_accept = min_f_2_p[~refuse_indices]
+                min_indices_accept = min_indices[~refuse_indices]
+
+                data.append(x[~refuse_indices])
+                data_aug.append(aug[~refuse_indices])
+
+                hard_label_indices = min_f_2_p_accept < thres1
+                soft_label_indices = min_f_2_p_accept >= thres1
+
+                n_hard = hard_label_indices.sum()
+                n_soft = soft_label_indices.sum()
+
+
+                labels_onehot = torch.zeros(n_hard + n_soft, n_proto).to(device)
+                labels_onehot[hard_label_indices].scatter_(1,min_indices_accept[hard_label_indices].view(-1, 1), 1)
+                labels_onehot[soft_label_indices, -self.args.num_unlabeled_classes_per_stage:] = F.softmax(cluster_accept[soft_label_indices], dim=1)
+
+                pseudo.append(labels_onehot)
+
+            data = torch.cat(data, dim=0).cpu()
+            data_aug = torch.cat(data_aug, dim=0).cpu()
+            pseudo = torch.cat(pseudo, dim=0).cpu()
+        else:
+            data = torch.tensor([]).cpu()
+            data_aug = torch.tensor([]).cpu()
+            pseudo = torch.tensor([]).cpu()
+
+        # n_samples = data.shape[0]
+
+        for y, P_y in enumerate(self.exemplar_sets):
+            img = torch.tensor(P_y)
+            img_aug = torch.tensor(self.exemplar_sets_aug[y])
+            if img.shape[0] == 0:
+                continue
+            label = torch.zeros(img.shape[0], n_proto).scatter(1, torch.tensor([label_2_proto[y]] * img.shape[0]).view(-1, 1), 1)
+            data = torch.cat([data, img], dim=0)
+            data_aug = torch.cat([data_aug, img_aug], dim=0)
+            pseudo = torch.cat([pseudo, label], dim=0)
+
+        # if args.mixup:
+        #     new_class_range_lower = args.num_labeled_classes
+
+        #     selector_for_new_classes = torch.any(pseudo[n_samples:][:, new_class_range_lower:] > 0, dim=1)
+
+        #     data_in_new_classes = data[n_samples:][selector_for_new_classes]
+        #     data_aug_in_new_classes = data_aug[n_samples:][selector_for_new_classes]
+        #     pseudo_in_new_classes = pseudo[n_samples:][selector_for_new_classes]
+
+        #     n_in_new_classes = data_in_new_classes.shape[0]
+
+        #     k = min(args.mixup_n, n_in_new_classes)
+
+        #     random_select_1 = torch.randperm(n_in_new_classes)[:k]
+        #     random_select_2 = torch.randperm(n_in_new_classes)[:k]
+
+        #     alpha = torch.rand(args.mixup_n, 1, 1, 1)
+
+        #     mixup_data = data_in_new_classes[random_select_1] * alpha + data_in_new_classes[random_select_2] * (1 - alpha)
+        #     mixup_aug = data_aug_in_new_classes[random_select_1] * alpha + data_aug_in_new_classes[random_select_2] * (1 - alpha)
+        #     mixup_pseudo = pseudo_in_new_classes[random_select_1] * alpha.view(-1, 1) + pseudo_in_new_classes[random_select_2] * (1 - alpha.view(-1, 1))
+
+        #     data = torch.cat([data, mixup_data], dim=0)
+        #     data_aug = torch.cat([data_aug, mixup_aug], dim=0)
+        #     pseudo = torch.cat([pseudo, mixup_pseudo], dim=0)
+
+        return torch.utils.data.TensorDataset(data, data_aug, pseudo)
+
+    @torch.no_grad()
+    def mixup(self, dataset, target_list, device, args):
+        n_classes = target_list[-1] + 1
+        n_proto = len(self.exemplar_means)
+        label_2_proto = [0] * n_classes
+        for p, l in enumerate(self.means_labels):
+            label_2_proto[l] = p
+        label_2_proto = torch.tensor(label_2_proto).long()
+
+        data = torch.tensor([])
+        data_aug = torch.tensor([])
+        pseudo = torch.tensor([])
+
+        for y, P_y in enumerate(self.exemplar_sets):
+            if y < args.num_labeled_classes:
+                continue
+            img = torch.tensor(P_y)
+            img_aug = torch.tensor(self.exemplar_sets_aug[y])
+            if img.shape[0] == 0:
+                continue
+            label = torch.zeros(img.shape[0], n_proto).scatter(1, torch.tensor([label_2_proto[y]] * img.shape[0]).view(-1, 1), 1)
+            data = torch.cat([data, img], dim=0)
+            data_aug = torch.cat([data_aug, img_aug], dim=0)
+            pseudo = torch.cat([pseudo, label], dim=0)
+
+        n_in_new_classes = data.shape[0]
+        k = min(args.mixup_n, n_in_new_classes)
+
+        random_select_1 = torch.randperm(n_in_new_classes)[:k]
+        random_select_2 = torch.randperm(n_in_new_classes)[:k]
+
+        alpha = np.random.beta(args.mixup_alpha, args.mixup_alpha, k)
+        alpha = torch.from_numpy(alpha).float().view(-1, 1, 1, 1)
+
+        mixup_data = data[random_select_1] * alpha + data[random_select_2] * (1 - alpha)
+        mixup_aug = data_aug[random_select_1] * alpha + data[random_select_2] * (1 - alpha)
+        mixup_pseudo = pseudo[random_select_1] * alpha.view(-1, 1) + pseudo[random_select_2] * (1 - alpha.view(-1, 1))
+        mixup_pseudo = F.softmax(mixup_pseudo, dim=1)
+
+        return torch.utils.data.ConcatDataset([dataset, torch.utils.data.TensorDataset(mixup_data, mixup_aug, mixup_pseudo)])
+
     def fix_backbone(self):
-        self.moco.encoder_q.eval()
-        self.moco.encoder_q.net.layer4.train()
-        self.moco.encoder_q.net.fc.train()
+        backbones = [
+            self.moco.encoder_q.net.conv1,
+            self.moco.encoder_q.net.bn1,
+            self.moco.encoder_q.net.layer1
+        ]
+        if self.args.branch_depth >= 2:
+            backbones.append(self.moco.encoder_q.net.layer2)
+        if self.args.branch_depth >= 3:
+            backbones.append(self.moco.encoder_q.net.layer3)
+
+        for l in backbones:
+            l.eval()
+            for p in l.parameters():
+                p.requires_grad = False
+                p.grad = None
+
+    def fix_branch(self, branch):
+        if branch == 0:
+            branch_layers = [
+                self.moco.encoder_q.net.layer2,
+                self.moco.encoder_q.net.layer3,
+                self.moco.encoder_q.net.layer4,
+                self.moco.encoder_q.net.fc[0],
+                self.cluster_head[0]
+            ]
+        else:
+            branch_layers = [
+                self.moco.encoder_q.net.branches[branch - 1],
+                self.moco.encoder_q.net.fc[branch],
+                self.cluster_head[branch]
+            ]
+        for l in branch_layers:
+            l.eval()
+            for p in l.parameters():
+                p.requires_grad = False
+                p.grad = None
+
 
     @torch.no_grad()
     def sync_weights(self):
         encoder_layers =self.moco.encoder_q.net
         old_weights_for_res4 = {
-            name: param.data.clone() for name, param in encoder_layers.layer4[0].named_parameters()
+            name: param.data.clone() for name, param in encoder_layers.layer4.named_parameters()
         }
         old_weights_for_linear = {
             name: param.data.clone() for name, param in encoder_layers.fc[0].named_parameters()
         }
-        for branch in range(1, 4):
-            for name, param in encoder_layers.layer4[branch].named_parameters():
+        for branch in range(1, 3):
+            for name, param in encoder_layers.branches[branch].named_parameters():
                 param.data = old_weights_for_res4[name]
-            for name, param in encoder_layers.fc[branch].named_parameters():
+            for name, param in encoder_layers.fc[branch + 1].named_parameters():
                 param.data = old_weights_for_linear[name]
+
+    @torch.no_grad()
+    def sync_new_branches(self):
+        branches = self.moco.encoder_q.net.branches
+        old_weights_for_branches = {
+            n: p.data.clone() for n, p in branches[0].named_parameters()
+        }
+        for b in range(1, 3):
+            for n, p in branches[b].named_parameters():
+                p.data = old_weights_for_branches[n]

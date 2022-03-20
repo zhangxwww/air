@@ -11,7 +11,7 @@ from sklearn.neighbors import kneighbors_graph
 from utils.util import BCE, PairEnum, accuracy, cluster_acc, AverageMeter, seed_torch, cluster_pred_2_gt, pred_2_gt_proj_acc
 from utils import ramps
 from models.resnet import ResNet, BasicBlock
-from models.baseline import Baseline_v4
+from models.model_ema_2 import Baseline_v4_ema_2
 from data.cifarloader import CIFAR100Loader, CIFAR100Data
 from data.exemplers import ExemplarDataset, TransformDataset
 # from data.rotationloader import DataLoader, GenericDataset
@@ -301,7 +301,20 @@ def train_cluster(model, writer, stage, device, args):
                 exemplars = [torch.from_numpy(exem).to(device).float() for exem in exemplars]
                 exemplars = torch.cat(exemplars, dim=0)
 
-                old_feature = model.moco.encoder_q(exemplars, 0)
+                if args.sync_backbone:
+                    selector = torch.randperm(exemplars.shape[0])[:args.batch_size].to(device)
+                    exemplars = exemplars[selector]
+                    if args.mix_cluster:
+                        c = np.random.beta(args.mixup_alpha, args.mixup_alpha)
+                        perm = torch.randperm(exemplars.shape[0]).to(device)
+                        exemplars = c * exemplars + (1 - c) * exemplars[perm]
+
+                with torch.no_grad():
+                    if args.sync_backbone:
+                        old_feature = model.old_encoder(exemplars, 0)
+                    else:
+                        old_feature = model.moco.encoder_q(exemplars, 0)
+                # old_feature = model.moco.encoder_q(exemplars, 0)
                 old_feature = F.normalize(old_feature, dim=1, p=2)
                 new_feature = model.moco.encoder_q(exemplars, stage)
                 new_feature = F.normalize(new_feature, dim=1, p=2)
@@ -516,7 +529,8 @@ def train_ssl_with_exemplars(model, writer, stage, device, args):
         # model.fix_backbone()
         # model.fix_branch(stage - 1)
 
-        train_loader_final = MixUpWrapper(args.mixup_alpha, train_loader, args) if args.batch_mixup else train_loader
+        mix_loader = MixUpWrapper(args.mixup_alpha, train_loader, args)
+        train_loader_final = mix_loader if args.batch_mixup else train_loader
 
         for x, x_bar, pseudo in train_loader_final:
             x, x_bar, pseudo = x.to(device), x_bar.to(device), pseudo.to(device)
@@ -539,14 +553,22 @@ def train_ssl_with_exemplars(model, writer, stage, device, args):
             loss = (-F.log_softmax(logits, dim=1) * pseudo_accept).sum(dim=1).mean()
 
             if args.pull_exemplar_features:
-                if not args.pef_all:
-                    exemplars = model.exemplar_sets[:target_list_lower]
+                if args.sync_backbone:
+                    selector = torch.any(pseudo[:, :target_list_lower] > 0.999, dim=1)
+                    exemplars = x[selector]
                 else:
-                    exemplars = model.exemplar_sets[:]
-                exemplars = [torch.from_numpy(exem).to(device).float() for exem in exemplars]
-                exemplars = torch.cat(exemplars, dim=0)
+                    if not args.pef_all:
+                        exemplars = model.exemplar_sets[:target_list_lower]
+                    else:
+                        exemplars = model.exemplar_sets[:]
+                    exemplars = [torch.from_numpy(exem).to(device).float() for exem in exemplars]
+                    exemplars = torch.cat(exemplars, dim=0)
 
-                old_feature = model.moco.encoder_q(exemplars, 0)
+                with torch.no_grad():
+                    if args.sync_backbone:
+                        old_feature = model.old_encoder(exemplars, 0)
+                    else:
+                        old_feature = model.moco.encoder_q(exemplars, 0)
                 old_feature = F.normalize(old_feature, dim=1, p=2)
                 new_feature = model.moco.encoder_q(exemplars, stage)
                 new_feature = F.normalize(new_feature, dim=1, p=2)
@@ -742,6 +764,7 @@ def test(model, loader, writer, stage, epoch, device, args):
     targets = np.array([])
     targets_with_refuse = np.array([])
     preds_new = np.array([])
+    preds_all_new = np.array([])
     no_accept = False
     branch_feat = args.branch_feat
     with torch.no_grad():
@@ -752,6 +775,10 @@ def test(model, loader, writer, stage, epoch, device, args):
 
             args.branch_feat = 'new'
             pred_new, _, _ = model.classify(x, stage)
+
+            args.branch_feat = 'all_new'
+            pred_all_new, _, _ = model.classify(x, stage)
+
             args.branch_feat = branch_feat
 
             targets = np.append(targets, label.cpu().numpy())
@@ -762,6 +789,7 @@ def test(model, loader, writer, stage, epoch, device, args):
                 no_accept = True
             targets_with_refuse = np.append(targets_with_refuse, label[~refuse_index].cpu().numpy())
             preds_new = np.append(preds_new, pred_new.cpu().numpy())
+            preds_all_new = np.append(preds_all_new, pred_all_new.cpu().numpy())
 
     proj = cluster_pred_2_gt(preds.astype(int), targets.astype(int))
     pacc_fun = partial(pred_2_gt_proj_acc, proj)
@@ -779,6 +807,11 @@ def test(model, loader, writer, stage, epoch, device, args):
     pacc = pacc_fun(targets.astype(int), preds_new.astype(int))
     writer.add_scalar('Test Stage {}/Pacc new'.format(stage + 1), pacc, epoch)
 
+    proj_all_new = cluster_pred_2_gt(preds_all_new.astype(int), targets.astype(int))
+    pacc_fun_all_new = partial(pred_2_gt_proj_acc, proj_all_new)
+    pacc = pacc_fun(targets.astype(int), preds_all_new.astype(int))
+    writer.add_scalar('Test Stage {}/Pacc all new'.format(stage + 1), pacc, epoch)
+
     # acc for labeled classes
     selected_mask = targets < args.num_labeled_classes
     pacc_labeled = pacc_fun(targets[selected_mask].astype(int), preds[selected_mask].astype(int))
@@ -793,6 +826,9 @@ def test(model, loader, writer, stage, epoch, device, args):
 
     pacc_labeled_new = pacc_fun_new(targets[selected_mask].astype(int), preds_new[selected_mask].astype(int))
     writer.add_scalar('Test Stage {}/Pacc new for 0-{}'.format(stage + 1, args.num_labeled_classes), pacc_labeled_new, epoch)
+
+    pacc_labeled_all_new = pacc_fun_all_new(targets[selected_mask].astype(int), preds_all_new[selected_mask].astype(int))
+    writer.add_scalar('Test Stage {}/Pacc all new for 0-{}'.format(stage + 1, args.num_labeled_classes), pacc_labeled_all_new, epoch)
 
     # acc for unlabeled classes in each stage
     for s in range(stage):
@@ -812,6 +848,17 @@ def test(model, loader, writer, stage, epoch, device, args):
 
         pacc_new = pacc_fun_new(targets[selected_mask].astype(int), preds_new[selected_mask].astype(int))
         writer.add_scalar('Test Stage {}/Pacc new for {}-{}'.format(stage + 1, lower, upper), pacc_new, epoch)
+
+        pacc_all_new = pacc_fun_all_new(targets[selected_mask].astype(int), preds_all_new[selected_mask].astype(int))
+        writer.add_scalar('Test Stage {}/Pacc all new for {}-{}'.format(stage + 1, lower, upper), pacc_all_new, epoch)
+
+
+def test_stage(model, writer, stage, device, args):
+    target_list_upper = args.num_labeled_classes + stage * args.num_unlabeled_classes_per_stage
+    target_list_test_all = list(range(target_list_upper))
+    test_dataset_all = CIFAR100Data(root=args.dataset_root, split='test', aug=None, target_list=target_list_test_all)
+    test_loader_all = DataLoader(test_dataset_all, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+    test(model, test_loader_all, writer, stage, args.cluster_epochs + args.inc_ssl_epochs, device, args)
 
 
 def update_exemplars(model, stage, args):
@@ -993,7 +1040,14 @@ if __name__ == "__main__":
     parser.add_argument('--print_cls_statistics', action='store_true', default=False)
     parser.add_argument('--save_exemplars', action='store_true', default=False)
 
+    parser.add_argument('--ema_branch', action='store_true', default=False)
+    parser.add_argument('--ema_branch_beta', type=float, default=0.99)
 
+    parser.add_argument('--sync_new_branch', action='store_true', default=False)
+    parser.add_argument('--sync_backbone', action='store_true', default=False)
+    parser.add_argument('--sync_backbone_beta', type=float, default=0.99)
+
+    parser.add_argument('--mix_cluster', action='store_true', default=False)
 
     parser.add_argument('--debug', action='store_true', default=False)
 
@@ -1010,7 +1064,7 @@ if __name__ == "__main__":
 
     print(args)
 
-    model = Baseline_v4(args)
+    model = Baseline_v4_ema_2(args)
     model = model.to(device)
 
 
@@ -1031,10 +1085,15 @@ if __name__ == "__main__":
             update_exemplars(model, stage, args)
             # if args.branch_depth == 3 and not args.no_sync:
             #     model.sync_weights()
+            # if args.sync_new_branch:
+            #     model.sync_new_branches()
             model.sync_new_branches()
-            model.fix_backbone()
+            if not args.sync_backbone:
+                model.fix_backbone()
             test_first_stage(model, writer, stage, device, args)
         else:
+            if args.sync_backbone:
+                model.save_backbone(stage)
             train_cluster(model, writer, stage, device, args)
             update_exemplars(model, stage, args)
             if args.ssl_exemplars:
@@ -1043,6 +1102,11 @@ if __name__ == "__main__":
                 train_ssl(model, writer, stage, device, args)
             if not args.no_ce:
                 train_ce(model, writer, stage, device, args)
+            if args.ema_branch:
+                model.sync_ema()
+            if args.sync_backbone:
+                model.ema_backbone(stage)
+            test_stage(model, writer, stage, device, args)
         if not args.same_branch or stage == 0:
             model.fix_branch(stage)
         model.increment_classes(args.num_unlabeled_classes_per_stage, device)

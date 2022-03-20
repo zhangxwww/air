@@ -5,9 +5,42 @@ import errno
 from tqdm import tqdm
 from PIL import Image
 import numpy as np
-import itertools    
+import itertools
 import torch
 from torch.utils.data.sampler import Sampler
+
+def mixup(alpha, data, aug, target, args):
+    with torch.no_grad():
+        selector_for_new_classes = torch.any(target[:, args.num_labeled_classes:] > 0, dim=1)
+
+        data_new = data[selector_for_new_classes]
+        aug_new = aug[selector_for_new_classes]
+        target_new = target[selector_for_new_classes]
+
+        bs = data_new.shape[0]
+        c = np.random.beta(alpha, alpha)
+        perm = torch.randperm(bs).to(data.device)
+        md = c * data_new + (1 - c) * data_new[perm]
+        ma = c * aug_new + (1 - c) * aug_new[perm]
+        mt = c * target_new + (1 - c) * target_new[perm]
+        return torch.cat((data, md), dim=0), torch.cat((aug, ma), dim=0), torch.cat((target, mt), dim=0)
+
+class MixUpWrapper():
+    def __init__(self, alpha, dataloader, args):
+        self.alpha = alpha
+        self.dataloader = dataloader
+        self.args = args
+
+    def mixup_loader(self, loader):
+        for data, aug, target in loader:
+            yield mixup(self.alpha, data, aug, target, self.args)
+
+    def __iter__(self):
+        return self.mixup_loader(self.dataloader)
+
+    def __len__(self):
+        return len(self.dataloader)
+
 
 class TransformKtimes:
     def __init__(self, transform, k=10):
@@ -16,7 +49,7 @@ class TransformKtimes:
 
     def __call__(self, inp):
         return torch.stack([self.transform(inp) for i in range(self.k)])
-        
+
 class TransformTwice:
     def __init__(self, transform):
         self.transform = transform

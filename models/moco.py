@@ -30,8 +30,10 @@ class SplitBatchNorm(nn.BatchNorm2d):
 
 class MultiBranchResNet(nn.Module):
     def __init__( self, block, layers, num_classes=1000, zero_init_residual=False, groups=1, width_per_group=64,
-        replace_stride_with_dilation=None, norm_layer=None):
+        replace_stride_with_dilation=None, norm_layer=None, branch_depth=3, same_branch_size=False, same_branch=False):
         super(MultiBranchResNet, self).__init__()
+
+        self.same_branch = same_branch
 
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -48,6 +50,7 @@ class MultiBranchResNet(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
+        self.branch_depth = branch_depth
         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
@@ -57,8 +60,52 @@ class MultiBranchResNet(nn.Module):
                                        dilate=replace_stride_with_dilation[0])
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
                                        dilate=replace_stride_with_dilation[1])
-        self.layer4 = nn.ModuleList([self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2]) \
-            for _ in range(4)])
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+
+        branches = []
+        if same_branch_size:
+            if branch_depth == 3:
+                for _ in range(3):
+                    self.inplanes = 256
+                    layer = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+                    branches.append(layer)
+            elif branch_depth == 2:
+                for _ in range(3):
+                    self.inplanes = 128
+                    layer = nn.Sequential(
+                        self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1]),
+                        self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+                    )
+                    branches.append(layer)
+            elif branch_depth == 1:
+                for _ in range(3):
+                    self.inplanes = 64
+                    layer = nn.Sequential(
+                        self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0]),
+                        self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1]),
+                        self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+                    )
+                    branches.append(layer)
+        else:
+            if branch_depth == 3:
+                for _ in range(3):
+                    self.inplanes = 256
+                    layer = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+                    branches.append(layer)
+            elif branch_depth == 2:
+                for _ in range(3):
+                    self.inplanes = 128
+                    layer = self._make_layer(block, 512, layers[3], stride=4, dilate=replace_stride_with_dilation[2])
+                    branches.append(layer)
+            elif branch_depth == 1:
+                for _ in range(3):
+                    self.inplanes = 64
+                    layer = self._make_layer(block, 512, layers[3], stride=8, dilate=replace_stride_with_dilation[2])
+                    branches.append(layer)
+
+        self.branches = nn.ModuleList(branches)
+        # self.layer4 = nn.ModuleList([self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2]) \
+        #     for _ in range(4)])
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.ModuleList([nn.Linear(512 * block.expansion, num_classes) for _ in range(4)])
@@ -80,7 +127,7 @@ class MultiBranchResNet(nn.Module):
                 elif isinstance(m, BasicBlock):
                     nn.init.constant_(m.bn2.weight, 0)  # type: ignore[arg-type]
 
-    def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+    def _make_layer(self, block, planes, blocks, stride=1, dilate=False, stride_expansion=-1):
         norm_layer = self._norm_layer
         downsample = None
         previous_dilation = self.dilation
@@ -98,9 +145,15 @@ class MultiBranchResNet(nn.Module):
                             self.base_width, previous_dilation, norm_layer))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, groups=self.groups,
-                                base_width=self.base_width, dilation=self.dilation,
-                                norm_layer=norm_layer))
+            if stride_expansion < 0:
+                layers.append(block(self.inplanes, planes, groups=self.groups,
+                                    base_width=self.base_width, dilation=self.dilation,
+                                    norm_layer=norm_layer))
+            else:
+                layers.append(block(self.inplanes, planes, stride * stride_expansion, groups=self.groups,
+                                    base_width=self.base_width, dilation=self.dilation,
+                                    norm_layer=norm_layer))
+
 
         return nn.Sequential(*layers)
 
@@ -110,14 +163,26 @@ class MultiBranchResNet(nn.Module):
         x = self.relu(x)
         # x = self.maxpool(x)
 
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
 
-        x = self.layer4[branch](x)
+        if branch == 0:
+            x = self.layer4(x3)
+        else:
+            b = branch if not self.same_branch else 1
+            if self.branch_depth == 3:
+                x = self.branches[b - 1](x3)
+            elif self.branch_depth == 2:
+                x = self.branches[b - 1](x2)
+            elif self.branch_depth == 1:
+                x = self.branches[b - 1](x1)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        x = self.fc[branch](x)
+        if self.same_branch and branch > 0:
+            x = self.fc[1](x)
+        else:
+            x = self.fc[branch](x)
 
         return x
 
@@ -162,12 +227,12 @@ class MultiBranchModelBase(nn.Module):
     (i) replaces conv1 with kernel=3, str=1
     (ii) removes pool1
     """
-    def __init__(self, feature_dim=128, arch=None, bn_splits=16):
+    def __init__(self, feature_dim=128, arch=None, bn_splits=16, branch_depth=3, same_branch=False):
         super(MultiBranchModelBase, self).__init__()
 
         # use split batchnorm
         norm_layer = partial(SplitBatchNorm, num_splits=bn_splits) if bn_splits > 1 else nn.BatchNorm2d
-        self.net = MultiBranchResNet(BasicBlock, [2, 2, 2, 2], num_classes=feature_dim, norm_layer=norm_layer)
+        self.net = MultiBranchResNet(BasicBlock, [2, 2, 2, 2], num_classes=feature_dim, norm_layer=norm_layer, branch_depth=branch_depth, same_branch=same_branch)
 
 
     def forward(self, x, branch=0):
@@ -183,18 +248,19 @@ class MultiBranchModelBase(nn.Module):
 
 
 class ModelMoCo(nn.Module):
-    def __init__(self, dim=128, K=4096, m=0.99, T=0.1, arch='resnet18', bn_splits=8, symmetric=True, multi_branch=False):
+    def __init__(self, dim=128, K=4096, m=0.99, T=0.1, arch='resnet18', bn_splits=8, symmetric=True, multi_branch=False, branch_depth=3, all_branch=False, same_branch=False):
         super(ModelMoCo, self).__init__()
 
         self.K = K
         self.m = m
         self.T = T
         self.symmetric = symmetric
+        self.all_branch = all_branch
 
         # create the encoders
         if multi_branch:
-            self.encoder_q = MultiBranchModelBase(feature_dim=dim, arch=arch, bn_splits=bn_splits)
-            self.encoder_k = MultiBranchModelBase(feature_dim=dim, arch=arch, bn_splits=bn_splits)
+            self.encoder_q = MultiBranchModelBase(feature_dim=dim, arch=arch, bn_splits=bn_splits, branch_depth=branch_depth, same_branch=same_branch)
+            self.encoder_k = MultiBranchModelBase(feature_dim=dim, arch=arch, bn_splits=bn_splits, branch_depth=branch_depth, same_branch=same_branch)
         else:
             self.encoder_q = ModelBase(feature_dim=dim, arch=arch, bn_splits=bn_splits)
             self.encoder_k = ModelBase(feature_dim=dim, arch=arch, bn_splits=bn_splits)
@@ -250,7 +316,7 @@ class ModelMoCo(nn.Module):
         """
         return x[idx_unshuffle]
 
-    def contrastive_loss(self, im_q, im_k):
+    def contrastive_loss(self, im_q, im_k, branch):
         # compute query features
         q = self.encoder_q(im_q)  # queries: NxC
         q = nn.functional.normalize(q, dim=1)  # already normalized
@@ -301,12 +367,18 @@ class ModelMoCo(nn.Module):
 
         # compute loss
         if self.symmetric:  # asymmetric loss
-            loss_12, q1, k2 = self.contrastive_loss(im1, im2)
-            loss_21, q2, k1 = self.contrastive_loss(im2, im1)
+            loss_12, q1, k2 = self.contrastive_loss(im1, im2, 0)
+            loss_21, q2, k1 = self.contrastive_loss(im2, im1, 0)
             loss = loss_12 + loss_21
             k = torch.cat([k1, k2], dim=0)
+            if self.all_branch:
+                loss_121, _, _ = self.contrastive_loss(im1, im2, 1)
+                loss_211, _, _ = self.contrastive_loss(im2, im1, 1)
+                loss += loss_121 + loss_211
         else:  # asymmetric loss
-            loss, q, k = self.contrastive_loss(im1, im2)
+            loss, q, k = self.contrastive_loss(im1, im2, 0)
+            if self.all_branch:
+                loss_1, _, _ = self.contrastive_loss(im1, im2, 1)
 
         self._dequeue_and_enqueue(k)
 
