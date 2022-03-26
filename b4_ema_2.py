@@ -30,6 +30,11 @@ torch.backends.cudnn.benchmark = True
 
 
 def train_first_ssl(model, writer, stage, device, args):
+    if args.cache_first_ssl:
+        state_dict = torch.load(os.path.join(args.model_dir, args.cache_first_ssl_dir))
+        model.load_state_dict(state_dict)
+        return
+
     lr = args.ssl_lr
     optimizer = SGD(model.parameters(), lr=lr, momentum=args.momentum, weight_decay=args.weight_decay)
     exp_lr_scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[60, 120, 160, 200], gamma=args.gamma)
@@ -305,9 +310,10 @@ def train_cluster(model, writer, stage, device, args):
                     selector = torch.randperm(exemplars.shape[0])[:args.batch_size].to(device)
                     exemplars = exemplars[selector]
                     if args.mix_cluster:
-                        c = np.random.beta(args.mixup_alpha, args.mixup_alpha)
-                        perm = torch.randperm(exemplars.shape[0]).to(device)
-                        exemplars = c * exemplars + (1 - c) * exemplars[perm]
+                        with torch.no_grad():
+                            c = np.random.beta(args.mixup_alpha, args.mixup_alpha)
+                            perm = torch.randperm(exemplars.shape[0]).to(device)
+                            exemplars = c * exemplars + (1 - c) * exemplars[perm]
 
                 with torch.no_grad():
                     if args.sync_backbone:
@@ -529,13 +535,13 @@ def train_ssl_with_exemplars(model, writer, stage, device, args):
         # model.fix_backbone()
         # model.fix_branch(stage - 1)
 
-        mix_loader = MixUpWrapper(args.mixup_alpha, train_loader, args)
+        mix_loader = MixUpWrapper(train_loader, args)
         train_loader_final = mix_loader if args.batch_mixup else train_loader
 
         for x, x_bar, pseudo in train_loader_final:
             x, x_bar, pseudo = x.to(device), x_bar.to(device), pseudo.to(device)
             classify_output, cluster_output, feature = model.ce_stage(x, stage)
-            classify_output_bar, cluster_output_bar, _ = model.ce_stage(x_bar, stage)
+            classify_output_bar, cluster_output_bar, feature_bar = model.ce_stage(x_bar, stage)
 
             feature_2_proto = dist_func(feature.cpu().detach().numpy(), prototypes.cpu().numpy())
             feature_2_proto = torch.from_numpy(feature_2_proto).to(device)
@@ -544,6 +550,7 @@ def train_ssl_with_exemplars(model, writer, stage, device, args):
             refuse_indices = min_f_2_p >= thres2
 
             feature_accept = feature[~refuse_indices]
+            feature_bar_accept = feature_bar[~refuse_indices]
             pseudo_accept = pseudo[~refuse_indices]
 
             # ssl: x1 >-< cur_proto, and x1 <-> old_protos
@@ -605,6 +612,17 @@ def train_ssl_with_exemplars(model, writer, stage, device, args):
                     loss += F.mse_loss(prob2, prob2_bar)
                     if not args.no_fc:
                         loss += F.mse_loss(prob1, prob1_bar)
+
+            if args.ssl_nce:
+                f = F.normalize(feature_accept, dim=1, p=2)
+                f_bar = F.normalize(feature_bar_accept, dim=1, p=2)
+                logits_neg = f.mm(f.t())
+                logits_neg = logits_neg * (1 - torch.eye(logits_neg.shape[0]).to(device).float())
+                logits_pos = torch.diag((f * f_bar).sum(dim=1))
+                logits = (logits_pos + logits_neg) / args.ssl_temperature
+                targets = torch.eye(logits.shape[0]).to(device)
+                loss_nce = (-F.log_softmax(logits, dim=1) * targets).sum(dim=1).mean()
+                loss += loss_nce * args.ssl_nce_weight
 
 
             loss_record.update(loss.item(), x.size(0))
@@ -1020,6 +1038,9 @@ if __name__ == "__main__":
     parser.add_argument('--ssl_exemplars', action='store_true', default=False)
     parser.add_argument('--ssl_with_cluster', action='store_true', default=False)
 
+    parser.add_argument('--ssl_nce', action='store_true', default=False)
+    parser.add_argument('--ssl_nce_weight', type=float, default=1.0)
+
     parser.add_argument('--reselect_exemplars', action='store_true', default=False)
     parser.add_argument('--reselect_exemplars_interval', type=int, default=10)
 
@@ -1034,8 +1055,11 @@ if __name__ == "__main__":
     parser.add_argument('--mixup', action='store_true', default=False)
     parser.add_argument('--mixup_n', type=int, default=512)
     parser.add_argument('--mixup_alpha', type=float, default=0.5)
+    parser.add_argument('--mixup_beta', type=float, default=0.5)
     parser.add_argument('--re_mixup', action='store_true', default=False)
     parser.add_argument('--batch_mixup', action='store_true', default=False)
+    parser.add_argument('--bmix_diff_alpha', action='store_true', default=False)
+    parser.add_argument('--pseudo_softmax', action='store_true', default=False)
 
     parser.add_argument('--print_cls_statistics', action='store_true', default=False)
     parser.add_argument('--save_exemplars', action='store_true', default=False)
@@ -1048,6 +1072,11 @@ if __name__ == "__main__":
     parser.add_argument('--sync_backbone_beta', type=float, default=0.99)
 
     parser.add_argument('--mix_cluster', action='store_true', default=False)
+
+    parser.add_argument('--mlp_ce', action='store_true', default=False)
+
+    parser.add_argument('--cache_first_ssl', action='store_true', default=False)
+    parser.add_argument('--cache_first_ssl_dir', type=str, default='b4_r_2_5_ema99_nb_incssl5e2_clulr5e2_nofc_ab_bw3_cos_sb_pef1_bn1_save/ssl_1.pth')
 
     parser.add_argument('--debug', action='store_true', default=False)
 
@@ -1106,7 +1135,7 @@ if __name__ == "__main__":
                 model.sync_ema()
             if args.sync_backbone:
                 model.ema_backbone(stage)
-            test_stage(model, writer, stage, device, args)
+            # test_stage(model, writer, stage, device, args)
         if not args.same_branch or stage == 0:
             model.fix_branch(stage)
         model.increment_classes(args.num_unlabeled_classes_per_stage, device)

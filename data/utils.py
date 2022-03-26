@@ -8,8 +8,9 @@ import numpy as np
 import itertools
 import torch
 from torch.utils.data.sampler import Sampler
+import torch.nn.functional as F
 
-def mixup(alpha, data, aug, target, args):
+def mixup(data, aug, target, args):
     with torch.no_grad():
         selector_for_new_classes = torch.any(target[:, args.num_labeled_classes:] > 0, dim=1)
 
@@ -17,23 +18,61 @@ def mixup(alpha, data, aug, target, args):
         aug_new = aug[selector_for_new_classes]
         target_new = target[selector_for_new_classes]
 
-        bs = data_new.shape[0]
-        c = np.random.beta(alpha, alpha)
-        perm = torch.randperm(bs).to(data.device)
-        md = c * data_new + (1 - c) * data_new[perm]
-        ma = c * aug_new + (1 - c) * aug_new[perm]
-        mt = c * target_new + (1 - c) * target_new[perm]
+        selector_for_current_data = torch.any(target_new[:, -args.num_unlabeled_classes_per_stage:] > 0, dim=1)
+        selector_for_previous_data = ~selector_for_current_data
+
+        n_cur = selector_for_current_data.sum().item()
+        n_pre = selector_for_previous_data.sum().item()
+
+        if args.bmix_diff_alpha and n_cur > 0 and n_pre > 0:
+
+            data_cur = data_new[selector_for_current_data]
+            aug_cur = aug_new[selector_for_current_data]
+            target_cur = target_new[selector_for_current_data]
+
+            data_pre = data_new[selector_for_previous_data]
+            aug_pre = aug_new[selector_for_previous_data]
+            target_pre = target_new[selector_for_previous_data]
+
+            # if args.debug:
+            #     print(n_cur, n_pre)
+
+            if n_cur < n_pre:
+                choice = np.random.choice(n_cur, n_pre)
+                data_cur = data_cur[choice]
+                aug_cur = aug_cur[choice]
+                target_cur = target_cur[choice]
+            else:
+                choice = np.random.choice(n_pre, n_cur)
+                data_pre = data_pre[choice]
+                aug_pre = aug_pre[choice]
+                target_pre = target_pre[choice]
+            assert data_cur.shape[0] == data_pre.shape[0]
+
+            c = np.random.beta(args.mixup_alpha, args.mixup_beta)
+            md = c * data_cur + (1 - c) * data_pre
+            ma = c * aug_cur + (1 - c) * aug_pre
+            mt = c * target_cur + (1 - c) * target_pre
+
+        else:
+            bs = data_new.shape[0]
+            c = np.random.beta(args.mixup_alpha, args.mixup_beta)
+            perm = torch.randperm(bs).to(data.device)
+            md = c * data_new + (1 - c) * data_new[perm]
+            ma = c * aug_new + (1 - c) * aug_new[perm]
+            mt = c * target_new + (1 - c) * target_new[perm]
+        if args.pseudo_softmax:
+            mt = F.normalize(mt, p=2, dim=1)
         return torch.cat((data, md), dim=0), torch.cat((aug, ma), dim=0), torch.cat((target, mt), dim=0)
 
 class MixUpWrapper():
-    def __init__(self, alpha, dataloader, args):
-        self.alpha = alpha
+    def __init__(self, dataloader, args):
         self.dataloader = dataloader
         self.args = args
 
     def mixup_loader(self, loader):
         for data, aug, target in loader:
-            yield mixup(self.alpha, data, aug, target, self.args)
+            yield mixup(data, aug, target, self.args)
 
     def __iter__(self):
         return self.mixup_loader(self.dataloader)

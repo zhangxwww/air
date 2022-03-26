@@ -23,6 +23,17 @@ class Baseline_v4_ema_2(nn.Module):
         self.bn = nn.BatchNorm1d(self.feature_dim, momentum=0.01)
         self.fc = nn.Linear(self.feature_dim, args.num_labeled_classes, bias=False)
 
+        self.mlp = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim // 2),
+            nn.BatchNorm1d(self.feature_dim // 2),
+            nn.Dropout(0.5),
+            nn.LeakyReLU(0.2),
+            nn.Linear(self.feature_dim // 2, self.feature_dim),
+            nn.BatchNorm1d(self.feature_dim),
+            nn.Dropout(0.5),
+            nn.LeakyReLU(0.2)
+        )
+
         self.exemplar_sets = []
         self.exemplar_sets_aug = []
 
@@ -50,7 +61,11 @@ class Baseline_v4_ema_2(nn.Module):
         feature = self.moco.encoder_q(x, stage)
         out = self.bn(feature)
         out = F.relu(out)
-        classification = self.fc(out)
+        if self.args.mlp_ce:
+            o = self.mlp(out)
+            classification = self.fc(o)
+        else:
+            classification = self.fc(out)
         cluster = self.cluster_head[stage](out)
         return classification, cluster, feature
 
